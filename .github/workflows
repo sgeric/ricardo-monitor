@@ -1,0 +1,50 @@
+name: Ricardo hourly monitor
+
+on:
+  schedule:
+    # GitHub Actions cron is UTC. This runs at minute 7 of every hour.
+    - cron: "7 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Ricardo monitor
+        env:
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_FROM: ${{ secrets.SMTP_FROM }}
+          # "notify" means the first run emails all matching listings it can currently see.
+          # Change to "baseline" if you want the first run to be silent.
+          INITIAL_MODE: notify
+        run: python monitor.py
+
+      - name: Save seen-listing state
+        if: always()
+        run: |
+          if [ -f seen.json ]; then
+            git config user.name "ricardo-monitor"
+            git config user.email "actions@users.noreply.github.com"
+            git add seen.json
+            git diff --cached --quiet || git commit -m "Update Ricardo seen listings"
+            git push
+          fi
