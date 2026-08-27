@@ -35,7 +35,7 @@ jobs:
           SMTP_FROM: ${{ secrets.SMTP_FROM }}
           # "notify" means the first run emails all matching listings it can currently see.
           # Change to "baseline" if you want the first run to be silent.
-          INITIAL_MODE: notify
+          INITIAL_MODE: baseline
         run: python monitor.py
 
       - name: Save seen-listing state
