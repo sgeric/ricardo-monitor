@@ -1,32 +1,5 @@
 #!/usr/bin/env python3
 
-"""
-Ricardo.ch hourly monitor for selected photo/video gear.
-
-- Searches only the configured terms.
-- Keeps only listings that offer "Sofort kaufen" (Buy Now).
-- "Sofort kaufen oder Preis vorschlagen" also matches.
-- Deduplicates by Ricardo article ID.
-- Sends one email containing all newly discovered matching listings.
-- State is stored in seen.json.
-
-Environment variables:
-  ALERT_EMAIL       Recipient address
-  SMTP_HOST         e.g. smtp.gmail.com or smtp.mail.yahoo.com
-  SMTP_PORT         usually 587
-  SMTP_USERNAME     SMTP account username/email
-  SMTP_PASSWORD     SMTP app password
-  SMTP_FROM         optional; defaults to SMTP_USERNAME
-  INITIAL_MODE      "notify" (default) or "baseline"
-
-IMPORTANT:
-Ricardo may change its HTML or anti-bot rules.
-This script uses public search pages and does not log in or buy/bid on anything.
-"""
-
-from __future__ import annotations
-
-import html
 import json
 import os
 import re
@@ -36,17 +9,16 @@ import time
 from dataclasses import dataclass
 from email.message import EmailMessage
 from pathlib import Path
-from typing import Iterable
 from urllib.parse import quote, urljoin
 
-import requests
 from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
 
 
 BASE_URL = "https://www.ricardo.ch"
-STATE_FILE = Path(os.getenv("STATE_FILE", "seen.json"))
+STATE_FILE = Path("seen.json")
 
-
+# Broader searches = fewer requests to Ricardo.
 SEARCHES = {
     "Sony a6xxx": [
         "Sony a6000",
@@ -57,117 +29,44 @@ SEARCHES = {
         "Sony a6600",
         "Sony a6700",
     ],
-
-    "Sony a7 II / III / IV": [
+    "Sony a7": [
         "Sony a7 II",
-        "Sony a7III",
         "Sony a7 III",
         "Sony a7 IV",
-        "Sony Alpha 7 II",
-        "Sony Alpha 7 III",
-        "Sony Alpha 7 IV",
     ],
-
     "Samyang lenses": [
         "Samyang Sony E",
-        "Samyang E-Mount",
-        "Samyang FE",
     ],
-
-    "Sigma Sony E lenses": [
+    "Sigma lenses": [
         "Sigma Sony E",
-        "Sigma E-Mount",
-        "Sigma Sony FE",
     ],
-
     "DJI Air": [
-        "DJI Air 2",
-        "DJI Air 2S",
-        "DJI Air 3",
-        "DJI Air 3S",
+        "DJI Air",
     ],
-
     "DJI Mini": [
-        "DJI Mini 3",
-        "DJI Mini 3 Pro",
-        "DJI Mini 4",
-        "DJI Mini 4 Pro",
-        "DJI Mini 5",
-        "DJI Mini 5 Pro",
+        "DJI Mini",
     ],
-
-    "DJI RS gimbals": [
+    "DJI RS": [
         "DJI RS",
-        "DJI RS 2",
-        "DJI RS 3",
-        "DJI RS 4",
-        "DJI RSC 2",
     ],
-
     "DJI Osmo Action": [
-        "DJI Osmo Action 3",
-        "DJI Osmo Action 4",
-        "DJI Osmo Action 5",
-        "DJI Osmo Action 6",
+        "DJI Osmo Action",
     ],
-
     "DJI Pocket": [
         "DJI Pocket",
-        "DJI Pocket 2",
-        "DJI Pocket 3",
-        "DJI Osmo Pocket",
     ],
-
     "Godox": [
-        "Godox Blitz",
-        "Godox Flash",
-        "Godox Licht",
-        "Godox Light",
-        "Godox Softbox",
-        "Godox AD200",
-        "Godox AD300",
-        "Godox AD400",
-        "Godox AD600",
-        "Godox V1",
-        "Godox V860",
+        "Godox",
     ],
-
-    "Rode microphones": [
-        "Rode VideoMic",
-        "RØDE VideoMic",
-        "Rode Wireless",
-        "RØDE Wireless",
-        "Rode Wireless GO",
-        "Rode Wireless PRO",
+    "Rode": [
+        "Rode",
     ],
 }
 
 
-CAMERA_ACCESSORY_NEGATIVE = re.compile(
-    r"\b("
-    r"cage|smallrig|akku|battery|ladegerät|charger|griff|grip|"
-    r"l.?bracket|winkel|strap|gurt|display|schutz|case|tasche|cover|"
-    r"adapter|dummy battery|netzteil"
-    r")\b",
-    re.I,
-)
-
-
-LENS_NEGATIVE = re.compile(
-    r"\b("
-    r"adapter|deckel|cap|hood only|gegenlichtblende|filter only|"
-    r"tasche|case|mount adapter"
-    r")\b",
-    re.I,
-)
-
-
 ARTICLE_RE = re.compile(
-    r"/(?:de|fr|it)/a/[^\"'?]+-(\d{8,})/?"
-)
-
-PRICE_RE = re.compile(
-    r"(?:CHF\s*)?(\d{1,3}(?:['’ ]\d{3})*(?:\.\d{2})?)"
+    r"/(?:de|fr|it)/a/[^\"'?]+-(\d{8,})/?",
+    re.I,
 )
 
 BUY_NOW_RE = re.compile(
@@ -180,6 +79,10 @@ OFFER_RE = re.compile(
     re.I,
 )
 
+PRICE_RE = re.compile(
+    r"(?:CHF\s*)?(\d{1,3}(?:['’ ]\d{3})*(?:\.\d{2})?)"
+)
+
 
 @dataclass(frozen=True)
 class Listing:
@@ -187,236 +90,167 @@ class Listing:
     title: str
     url: str
     price: str
-    buy_now: bool
     price_suggestion: bool
     group: str
     query: str
 
 
-def create_session() -> requests.Session:
-    session = requests.Session()
-
-    session.headers.update(
-        {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/152.0 Safari/537.36"
-            ),
-            "Accept-Language": "de-CH,de;q=0.9,en;q=0.8",
-            "Accept": "text/html,application/xhtml+xml",
-        }
-    )
-
-    return session
-
-
-def search_url(query: str) -> str:
+def search_url(query):
     return f"{BASE_URL}/de/s/{quote(query, safe='')}/"
 
 
-def clean_text(text: str) -> str:
-    return re.sub(
-        r"\s+",
-        " ",
-        html.unescape(text or ""),
-    ).strip()
+def clean_text(text):
+    return re.sub(r"\s+", " ", text or "").strip()
 
 
-def likely_relevant(group: str, title: str) -> bool:
-    title_lower = title.lower()
+def likely_relevant(group, title):
+    t = title.lower()
 
-    if group.startswith("Sony a6") or group.startswith("Sony a7"):
-        return not CAMERA_ACCESSORY_NEGATIVE.search(title)
+    accessory_words = [
+        "cage",
+        "smallrig",
+        "akku",
+        "battery",
+        "ladegerät",
+        "charger",
+        "l-bracket",
+        "strap",
+        "gurt",
+        "cover",
+        "case only",
+        "adapter only",
+    ]
 
-    if "lenses" in group.lower():
-        if LENS_NEGATIVE.search(title):
+    if group in ("Sony a6xxx", "Sony a7"):
+        if any(x in t for x in accessory_words):
             return False
 
-        if group.startswith("Sigma"):
-            return bool(
-                re.search(
-                    r"\b(sony|e[- ]?mount|fe)\b",
-                    title_lower,
-                    re.I,
-                )
-            )
+    if group == "DJI RS":
+        negatives = [
+            "plate",
+            "platte",
+            "cable",
+            "kabel",
+            "case only",
+            "handle only",
+        ]
 
-        return True
+        if any(x in t for x in negatives):
+            return False
 
-    if group == "DJI RS gimbals":
-        return not re.search(
-            r"\b("
-            r"plate|platte|griff|handle|case|tasche|"
-            r"motor only|cable|kabel"
-            r")\b",
-            title,
-            re.I,
+    if group == "Rode":
+        wanted = [
+            "videomic",
+            "wireless",
+        ]
+
+        return any(x in t for x in wanted)
+
+    if group == "Sigma lenses":
+        return (
+            "sony" in t
+            or "e-mount" in t
+            or " e " in t
+            or " fe " in t
         )
 
-    if group == "Rode microphones":
-        return not re.search(
-            r"\b("
-            r"cable|kabel|windshield only|deadcat only|"
-            r"adapter only|case only"
-            r")\b",
-            title,
-            re.I,
+    if group == "Samyang lenses":
+        return (
+            "sony" in t
+            or "e-mount" in t
+            or " e " in t
+            or " fe " in t
         )
 
     return True
 
 
-def extract_listing_blocks(
-    page_html: str,
-    group: str,
-    query: str,
-) -> list[Listing]:
+def parse_page(html, group, query):
+    soup = BeautifulSoup(html, "html.parser")
 
-    soup = BeautifulSoup(page_html, "html.parser")
-
-    found: dict[str, Listing] = {}
+    found = {}
 
     for anchor in soup.find_all("a", href=True):
+        href = anchor.get("href", "")
 
-        href = anchor["href"]
+        match = ARTICLE_RE.search(href)
 
-        article_match = ARTICLE_RE.search(href)
-
-        if not article_match:
+        if not match:
             continue
 
-        article_id = article_match.group(1)
-
-        url = urljoin(
-            BASE_URL,
-            href.split("?")[0],
-        )
+        article_id = match.group(1)
 
         node = anchor
         block_text = ""
 
-        for _ in range(8):
-
+        # Walk upwards until we reach the listing card.
+        for _ in range(10):
             node = getattr(node, "parent", None)
 
             if node is None:
                 break
 
             text = clean_text(
-                node.get_text(
-                    " ",
-                    strip=True,
-                )
+                node.get_text(" ", strip=True)
             )
 
-            if (
-                BUY_NOW_RE.search(text)
-                or OFFER_RE.search(text)
-            ):
+            if BUY_NOW_RE.search(text):
                 block_text = text
                 break
 
+        # We ONLY want Buy Now listings.
         if not block_text:
             continue
 
-        buy_now = bool(
-            BUY_NOW_RE.search(block_text)
+        if not BUY_NOW_RE.search(block_text):
+            continue
+
+        title = clean_text(
+            anchor.get_text(" ", strip=True)
         )
 
-        if not buy_now:
+        if len(title) < 4:
+            continue
+
+        if len(title) > 220:
+            title = title[:217] + "..."
+
+        if not likely_relevant(group, title):
             continue
 
         price_suggestion = bool(
             OFFER_RE.search(block_text)
         )
 
-        title = clean_text(
-            anchor.get_text(
-                " ",
-                strip=True,
-            )
-        )
-
-        if len(title) < 4:
-            title = clean_text(
-                block_text.split("Sofort")[0]
-            )[:180]
-
-        if len(title) > 220:
-            title = title[:217] + "..."
-
-        if not likely_relevant(
-            group,
-            title,
-        ):
-            continue
-
-        price = "Price not parsed"
-
-        numbers = PRICE_RE.findall(
-            block_text
-        )
+        numbers = PRICE_RE.findall(block_text)
 
         if numbers:
             price = (
                 "CHF "
-                + numbers[-1].replace(
-                    "’",
-                    "'",
-                )
+                + numbers[-1].replace("’", "'")
             )
+        else:
+            price = "Price not parsed"
 
-        listing = Listing(
+        url = urljoin(
+            BASE_URL,
+            href.split("?")[0],
+        )
+
+        found[article_id] = Listing(
             article_id=article_id,
-            title=title or f"Ricardo article {article_id}",
+            title=title,
             url=url,
             price=price,
-            buy_now=True,
             price_suggestion=price_suggestion,
             group=group,
             query=query,
         )
 
-        found[article_id] = listing
-
     return list(found.values())
 
 
-def fetch_query(
-    session: requests.Session,
-    group: str,
-    query: str,
-) -> list[Listing]:
-
-    url = search_url(query)
-
-    response = session.get(
-        url,
-        timeout=30,
-    )
-
-    response.raise_for_status()
-
-    lower = response.text.lower()
-
-    if (
-        len(response.text) < 5000
-        or "captcha" in lower
-    ):
-        raise RuntimeError(
-            f"Ricardo returned a possible challenge page for: {query}"
-        )
-
-    return extract_listing_blocks(
-        response.text,
-        group,
-        query,
-    )
-
-
-def load_seen() -> set[str]:
-
+def load_seen():
     if not STATE_FILE.exists():
         return set()
 
@@ -428,26 +262,18 @@ def load_seen() -> set[str]:
         )
 
         return set(
-            data.get(
-                "seen_ids",
-                [],
-            )
+            data.get("seen_ids", [])
         )
 
     except Exception:
         return set()
 
 
-def save_seen(
-    ids: Iterable[str],
-) -> None:
-
+def save_seen(ids):
     STATE_FILE.write_text(
         json.dumps(
             {
-                "seen_ids": sorted(
-                    set(ids)
-                )
+                "seen_ids": sorted(ids)
             },
             indent=2,
         ),
@@ -455,32 +281,17 @@ def save_seen(
     )
 
 
-def send_email(
-    items: list[Listing],
-) -> None:
+def send_email(items):
+    recipient = os.environ["ALERT_EMAIL"]
 
-    recipient = os.environ[
-        "ALERT_EMAIL"
-    ]
-
-    host = os.environ[
-        "SMTP_HOST"
-    ]
+    host = os.environ["SMTP_HOST"]
 
     port = int(
-        os.getenv(
-            "SMTP_PORT",
-            "587",
-        )
+        os.getenv("SMTP_PORT", "587")
     )
 
-    username = os.environ[
-        "SMTP_USERNAME"
-    ]
-
-    password = os.environ[
-        "SMTP_PASSWORD"
-    ]
+    username = os.environ["SMTP_USERNAME"]
+    password = os.environ["SMTP_PASSWORD"]
 
     sender = os.getenv(
         "SMTP_FROM",
@@ -490,21 +301,20 @@ def send_email(
     message = EmailMessage()
 
     message["Subject"] = (
-        f"Ricardo: {len(items)} new photo/video "
-        f"listing{'s' if len(items) != 1 else ''}"
+        f"Ricardo: {len(items)} new listing"
+        f"{'s' if len(items) != 1 else ''}"
     )
 
     message["From"] = sender
     message["To"] = recipient
 
     lines = [
-        f"{len(items)} new matching Ricardo listing(s):",
+        f"{len(items)} new Ricardo listing(s):",
         "",
     ]
 
     for item in items:
-
-        offer_type = (
+        offer = (
             "Buy Now + Price Suggestion"
             if item.price_suggestion
             else "Buy Now"
@@ -513,17 +323,12 @@ def send_email(
         lines.extend(
             [
                 item.title,
-                f"{item.price} — {offer_type}",
+                f"{item.price} — {offer}",
                 f"Category: {item.group}",
-                f"Search: {item.query}",
                 item.url,
                 "",
             ]
         )
-
-    lines.append(
-        "Only listings not previously seen by the monitor are included."
-    )
 
     message.set_content(
         "\n".join(lines)
@@ -544,58 +349,113 @@ def send_email(
             password,
         )
 
-        smtp.send_message(
-            message
+        smtp.send_message(message)
+
+
+def main():
+    all_items = {}
+    errors = []
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True
         )
 
+        context = browser.new_context(
+            locale="de-CH",
+            viewport={
+                "width": 1440,
+                "height": 1000,
+            },
+        )
 
-def main() -> int:
+        page = context.new_page()
 
-    session = create_session()
+        for group, queries in SEARCHES.items():
+            for query in queries:
+                print(f"\nChecking: {query}")
 
-    all_items: dict[str, Listing] = {}
+                try:
+                    response = page.goto(
+                        search_url(query),
+                        wait_until="domcontentloaded",
+                        timeout=45000,
+                    )
 
-    errors: list[str] = []
+                    if response is None:
+                        raise RuntimeError(
+                            "No HTTP response"
+                        )
 
-    for group, queries in SEARCHES.items():
+                    print(
+                        f"{query}: HTTP "
+                        f"{response.status}"
+                    )
 
-        for query in queries:
+                    if response.status == 403:
+                        raise RuntimeError(
+                            "Ricardo returned HTTP 403"
+                        )
 
-            try:
+                    if response.status >= 400:
+                        raise RuntimeError(
+                            f"HTTP {response.status}"
+                        )
 
-                items = fetch_query(
-                    session,
-                    group,
-                    query,
-                )
+                    page.wait_for_timeout(2500)
 
-                print(
-                    f"{query}: "
-                    f"{len(items)} matching listing(s)"
-                )
+                    html = page.content()
 
-                for item in items:
-                    all_items[
-                        item.article_id
-                    ] = item
+                    lower = html.lower()
 
-            except Exception as exc:
+                    if "captcha" in lower:
+                        raise RuntimeError(
+                            "Possible CAPTCHA/challenge page"
+                        )
 
-                errors.append(
-                    f"{query}: {exc}"
-                )
+                    items = parse_page(
+                        html,
+                        group,
+                        query,
+                    )
 
-            time.sleep(0.8)
+                    print(
+                        f"{query}: "
+                        f"{len(items)} matching "
+                        f"Buy Now listing(s)"
+                    )
 
-    if not all_items and errors:
+                    for item in items:
+                        all_items[
+                            item.article_id
+                        ] = item
 
+                except Exception as exc:
+                    error = (
+                        f"{query}: {exc}"
+                    )
+
+                    errors.append(error)
+                    print(error)
+
+                # Be polite to Ricardo.
+                time.sleep(2)
+
+        browser.close()
+
+    # Important:
+    # Don't overwrite seen.json when Ricardo blocked everything.
+    if not all_items:
         print(
-            "No listings parsed."
+            "\nNo matching listings were obtained.",
+            file=sys.stderr,
         )
 
-        print(
-            "\n".join(errors)
-        )
+        if errors:
+            print(
+                "\n".join(errors),
+                file=sys.stderr,
+            )
 
         return 2
 
@@ -605,6 +465,25 @@ def main() -> int:
         all_items.keys()
     )
 
+    first_run = not STATE_FILE.exists()
+
+    initial_mode = os.getenv(
+        "INITIAL_MODE",
+        "notify",
+    ).lower()
+
+    if first_run and initial_mode == "baseline":
+        save_seen(current_ids)
+
+        print(
+            f"\nBaseline created with "
+            f"{len(current_ids)} listings."
+        )
+
+        print("No email sent.")
+
+        return 0
+
     new_items = [
         item
         for article_id, item
@@ -612,37 +491,7 @@ def main() -> int:
         if article_id not in seen
     ]
 
-    initial_mode = os.getenv(
-        "INITIAL_MODE",
-        "notify",
-    ).lower()
-
-    first_run = (
-        not STATE_FILE.exists()
-    )
-
-    if (
-        first_run
-        and initial_mode == "baseline"
-    ):
-
-        save_seen(
-            current_ids
-        )
-
-        print(
-            f"Baseline created with "
-            f"{len(current_ids)} listings."
-        )
-
-        print(
-            "No email sent."
-        )
-
-        return 0
-
     if new_items:
-
         new_items.sort(
             key=lambda item: int(
                 item.article_id
@@ -650,19 +499,16 @@ def main() -> int:
             reverse=True,
         )
 
-        send_email(
-            new_items
-        )
+        send_email(new_items)
 
         print(
-            f"Sent alert for "
+            f"\nEMAIL SENT: "
             f"{len(new_items)} new listing(s)."
         )
 
     else:
-
         print(
-            "No new matching listings."
+            "\nNo new matching listings."
         )
 
     save_seen(
@@ -670,15 +516,9 @@ def main() -> int:
     )
 
     if errors:
-
         print(
-            f"\nNon-fatal search errors "
-            f"({len(errors)}):",
-            file=sys.stderr,
-        )
-
-        print(
-            "\n".join(errors),
+            f"\nThere were "
+            f"{len(errors)} search errors.",
             file=sys.stderr,
         )
 
