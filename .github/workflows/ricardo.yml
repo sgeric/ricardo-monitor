@@ -2,49 +2,84 @@ name: Ricardo hourly monitor
 
 on:
   schedule:
-    # GitHub Actions cron is UTC. This runs at minute 7 of every hour.
+    # GitHub Actions koristi UTC.
+    # Pokretanje svakog sata u 7. minutu.
     - cron: "7 * * * *"
+
+  # Omogucava rucno pokretanje iz GitHub Actions taba.
   workflow_dispatch:
 
+# Potrebno da workflow moze da sacuva seen.json nazad u repo.
 permissions:
   contents: write
+
+# Sprečava da se dve provere izvršavaju istovremeno.
+concurrency:
+  group: ricardo-monitor
+  cancel-in-progress: false
 
 jobs:
   monitor:
     runs-on: ubuntu-latest
 
     steps:
+      # 1. Preuzmi repository
       - name: Checkout
         uses: actions/checkout@v4
 
+      # 2. Python
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
+      # 3. Instaliraj Python dependencies i Chromium
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
 
+      # 4. Pokreni Ricardo monitor
       - name: Run Ricardo monitor
         env:
           ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
+
           SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+
           SMTP_FROM: ${{ secrets.SMTP_FROM }}
-          # "notify" means the first run emails all matching listings it can currently see.
-          # Change to "baseline" if you want the first run to be silent.
+
+          # Za prvi uspesan test:
+          # baseline = sacuvaj trenutne oglase bez slanja emaila.
+          #
+          # Nakon sto potvrdimo da sve radi,
+          # promenicemo ovo u "notify".
           INITIAL_MODE: baseline
+
         run: python monitor.py
 
+      # 5. Sacuvaj seen.json
+      # Tako sledeca provera zna koje oglase je vec videla.
       - name: Save seen-listing state
         if: always()
         run: |
           if [ -f seen.json ]; then
+
             git config user.name "ricardo-monitor"
             git config user.email "actions@users.noreply.github.com"
+
             git add seen.json
-            git diff --cached --quiet || git commit -m "Update Ricardo seen listings"
-            git push
+
+            if ! git diff --cached --quiet; then
+              git commit -m "Update Ricardo seen listings"
+              git push
+            else
+              echo "No changes to seen.json"
+            fi
+
+          else
+            echo "seen.json does not exist"
           fi
